@@ -1,5 +1,6 @@
 import streamlit as st
 import pdfplumber, re, pandas as pd, io
+from collections import defaultdict
 
 st.set_page_config(page_title="Valeo → XLSX (auto-detect)", layout="wide")
 st.title("Valeo PDF → XLSX (auto-detect: Invoice & Packing)")
@@ -14,15 +15,18 @@ def eu_to_float(s: str):
     except Exception:
         return None
 
+def read_pdf(file):
+    return pdfplumber.open(io.BytesIO(file.read()))
+
 def read_pdf_text(file):
     with pdfplumber.open(io.BytesIO(file.read())) as pdf:
-        return [p.extract_text() or "" for p in pdf.pages]
+        return "\n".join([(p.extract_text() or "") for p in pdf.pages])
 
 # ---------- Valeo INVOICE ----------
 def parse_valeo_invoice_text(full_text:str) -> pd.DataFrame:
     rows = []
     current_inv = None
-    inv_re = re.compile(r"\b(695\d{6})\b")  # Valeo invoice number
+    inv_re = re.compile(r"\b(695\d{6})\b")
 
     for raw_line in (l for l in full_text.splitlines() if l.strip()):
         m_inv = inv_re.search(raw_line)
@@ -65,50 +69,58 @@ def parse_valeo_invoice_text(full_text:str) -> pd.DataFrame:
         qty = int(tok[j-1])
         net_price = eu_to_float(tok[-2])
         tot_net   = eu_to_float(tok[-1])
-
         rows.append([supplier_token, qty, net_price, tot_net, current_inv])
 
     return pd.DataFrame(rows, columns=["Supplier_ID","Qty","Net Price","Tot. Net Value","InvoiceNo"])
 
-# ---------- Valeo PACKING (sequential parser) ----------
-def parse_valeo_packing_pages(page_texts:list[str]) -> pd.DataFrame:
-    """
-    Sequential parser:
-    - Process only pages that contain 'PACKING LIST'.
-    - Walk line by line, top to bottom.
-    - When line matches '<digits> PALLET', set current_parcel.
-    - Any line with '<SupplierID 4-8 digits> <Qty>' belongs to that parcel.
-    - Keeps duplicates, preserves order.
-    """
+# ---------- Valeo PACKING (using extract_words) ----------
+def parse_valeo_packing_pdf(pdf) -> pd.DataFrame:
     rows = []
     current_parcel = None
-    parcel_pat = re.compile(r"^\s*(?P<parcel>\d{6,})\s+PALLET\b", re.IGNORECASE)
-    item_pat   = re.compile(r"(?P<valeo>\d{4,8})\s+(?P<qty>\d+)\b")
+    parcel_pat = re.compile(r"^\s*(?P<parcel>\d{6,})$")
+    item_code_pat = re.compile(r"^\d{4,8}$")
 
-    for page in page_texts:
-        # filter: only pages with "PACKING LIST"
-        if "PACKING LIST" not in page.upper():
+    for page in pdf.pages:
+        page_text = page.extract_text() or ""
+        if "PACKING LIST" not in page_text.upper():
             continue
 
-        for raw_line in (l for l in page.splitlines() if l.strip()):
-            m_parcel = parcel_pat.match(raw_line)
-            if m_parcel:
-                current_parcel = m_parcel.group("parcel")
+        words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
+        # group words by line (same top within tolerance)
+        lines = defaultdict(list)
+        for w in words:
+            lines[round(w["top"], 1)].append(w)
+
+        for _, ws in sorted(lines.items(), key=lambda kv: kv[0]):
+            texts = [w["text"] for w in sorted(ws, key=lambda x: x["x0"])]
+
+            # detect parcel header
+            if len(texts) >= 2 and texts[1].upper().startswith("PALLET") and texts[0].isdigit():
+                current_parcel = texts[0]
                 continue
 
-            m_item = item_pat.search(raw_line)
-            if m_item and current_parcel:
-                supplier = m_item.group("valeo")
-                qty      = int(m_item.group("qty"))
+            if not current_parcel:
+                continue
+
+            # find supplier_id and quantity in this line
+            supplier_ids = [t for t in texts if item_code_pat.match(t)]
+            qtys = [t for t in texts if t.isdigit()]
+            if supplier_ids and qtys:
+                supplier = supplier_ids[0]
+                qty = int(qtys[-1])  # take rightmost number as quantity
                 rows.append([current_parcel, supplier, qty])
 
     return pd.DataFrame(rows, columns=["Parcel N°","VALEO Material N°","Quantity"]).reset_index(drop=True)
 
 # ---------- autodetect ----------
-def autodetect(page_texts:list[str]):
-    full_text = "\n".join(page_texts)
-    inv_df  = parse_valeo_invoice_text(full_text)
-    pack_df = parse_valeo_packing_pages(page_texts)
+def autodetect(file):
+    pdf = read_pdf(file)
+    text = "\n".join([(p.extract_text() or "") for p in pdf.pages])
+
+    inv_df  = parse_valeo_invoice_text(text)
+    pack_df = parse_valeo_packing_pdf(pdf)
+
+    pdf.close()
     return inv_df, pack_df
 
 # ---------- UI ----------
@@ -116,9 +128,8 @@ if uploads:
     for up in uploads:
         st.markdown("---")
         st.subheader(f"File: {up.name}")
-        page_texts = read_pdf_text(up)
+        inv_df, pack_df = autodetect(up)
 
-        inv_df, pack_df = autodetect(page_texts)
         produced_any = False
 
         if len(inv_df) > 0:
@@ -137,7 +148,7 @@ if uploads:
 
         if len(pack_df) > 0:
             produced_any = True
-            st.write(f"**Packing lines detected (order preserved):** {len(pack_df)} rows")
+            st.write(f"**Packing lines detected:** {len(pack_df)} rows (Σ Quantity={pack_df['Quantity'].sum()})")
             st.dataframe(pack_df, use_container_width=True, height=320)
             buf2 = io.BytesIO()
             with pd.ExcelWriter(buf2, engine="openpyxl") as xw:
