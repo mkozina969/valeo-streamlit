@@ -74,10 +74,11 @@ def parse_valeo_invoice_text(full_text:str) -> pd.DataFrame:
 def parse_valeo_packing_pages(page_texts:list[str]) -> pd.DataFrame:
     """
     Sequential parser:
+    - Process only pages that contain 'PACKING LIST'.
     - Walk line by line, top to bottom.
     - When line matches '<digits> PALLET', set current_parcel.
     - Any line with '<SupplierID 4-8 digits> <Qty>' belongs to that parcel.
-    - Keeps duplicates, preserves order exactly.
+    - Keeps duplicates, preserves order.
     """
     rows = []
     current_parcel = None
@@ -85,6 +86,10 @@ def parse_valeo_packing_pages(page_texts:list[str]) -> pd.DataFrame:
     item_pat   = re.compile(r"(?P<valeo>\d{4,8})\s+(?P<qty>\d+)\b")
 
     for page in page_texts:
+        # filter: only pages with "PACKING LIST"
+        if "PACKING LIST" not in page.upper():
+            continue
+
         for raw_line in (l for l in page.splitlines() if l.strip()):
             m_parcel = parcel_pat.match(raw_line)
             if m_parcel:
