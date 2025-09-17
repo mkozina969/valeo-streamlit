@@ -15,25 +15,23 @@ def eu_to_float(s: str):
         return None
 
 def read_pdf_text(file):
-    # read ALL pages (concatenated)
     with pdfplumber.open(io.BytesIO(file.read())) as pdf:
         page_texts = [(p.extract_text() or "") for p in pdf.pages]
     return "\n".join(page_texts)
 
-# ---------- Valeo INVOICE (locked logic) ----------
+# ---------- Valeo INVOICE ----------
 def parse_valeo_invoice_text(text:str) -> pd.DataFrame:
     rows = []
     current_inv = None
     inv_re = re.compile(r"\b(695\d{6})\b")  # Valeo invoice number
 
     for raw_line in (l for l in text.splitlines() if l.strip()):
-        # capture invoice number when seen
+        # capture invoice number if present
         m_inv = inv_re.search(raw_line)
         if m_inv:
             current_inv = m_inv.group(1)
 
         low = raw_line.lower()
-        # skip non-line blocks
         if low.startswith((
             "your order:", "delivery note:", "goods value",
             "vat rate", "transport cost", "currency",
@@ -49,7 +47,7 @@ def parse_valeo_invoice_text(text:str) -> pd.DataFrame:
         if not (re.fullmatch(r"[\d\.,]+", tok[-1]) and re.fullmatch(r"[\d\.,]+", tok[-2])):
             continue
 
-        # find "... Qty(int) Orig(AA) Customs(6-8d) ..." scanning leftwards
+        # detect "... Qty(int) Orig(AA) Customs(6-8d) ..."
         j = None
         for k in range(len(tok)-3, 1, -1):
             if (re.fullmatch(r"[A-Z]{2}", tok[k]) and
@@ -60,7 +58,7 @@ def parse_valeo_invoice_text(text:str) -> pd.DataFrame:
         if j is None:
             continue
 
-        # supplier_id = first numeric token BEFORE Qty (robust; handles stray tokens)
+        # supplier_id = first numeric token BEFORE Qty
         supplier_token = None
         for t in tok[:j-1]:
             if re.fullmatch(r"\d+", t):
@@ -73,37 +71,31 @@ def parse_valeo_invoice_text(text:str) -> pd.DataFrame:
         net_price = eu_to_float(tok[-2])
         tot_net   = eu_to_float(tok[-1])
 
-        # IMPORTANT: do NOT drop_duplicates — keep repeat lines (same supplier_id, different prices)
         rows.append([supplier_token, qty, net_price, tot_net, current_inv])
 
     df = pd.DataFrame(rows, columns=["Supplier_ID","Qty","Net Price","Tot. Net Value","InvoiceNo"])
     return df
 
-# ---------- Valeo PACKING (locked logic) ----------
+# ---------- Valeo PACKING ----------
 def parse_valeo_packing_text(text:str) -> pd.DataFrame:
     """
     Valeo PACKING:
-    - Capture VALEO Material N° as a 5–8 digit number (prevents '011' etc.).
-    - Quantity is an integer.
-    - Assign Parcel N° by proximity to the nearest 'PALLET' header (above/below).
-    - Keep duplicates (same material on multiple pallets).
+    - VALEO Material N° must be 5–8 digits (filters out codes like '011').
+    - Quantity is integer.
+    - Assign Parcel N° by nearest 'PALLET' line.
+    - Keep duplicates (same item across multiple pallets).
     """
-    import re, pandas as pd
     lines = [l for l in text.splitlines() if l.strip()]
 
-    # PALLET headers (parcel numbers)
+    # PALLET headers
     parcel_pat = re.compile(r"^\s*(?P<parcel>\d{6,})\s+PALLET\b")
     parcels = [(i, parcel_pat.match(ln).group("parcel"))
                for i, ln in enumerate(lines) if parcel_pat.match(ln)]
     if not parcels:
-        # No pallet headers -> return empty table
         return pd.DataFrame(columns=["Parcel N°","VALEO Material N°","Quantity"])
 
-    # Item lines:
-    #   <...> <VALEO 5–8 digits> <Qty int> [optional extra numeric/customer tokens] [end]
-    item_pat = re.compile(
-        r"(?P<valeo>\b\d{5,8}\b)\s+(?P<qty>\d+)(?:\s+\d+)?(?:\s+[A-Z0-9\-\/]+)?\s*$"
-    )
+    # Items
+    item_pat = re.compile(r"(?P<valeo>\b\d{5,8}\b)\s+(?P<qty>\d+)(?:\s+\d+)?(?:\s+[A-Z0-9\-\/]+)?\s*$")
 
     rows = []
     for idx, ln in enumerate(lines):
@@ -112,14 +104,12 @@ def parse_valeo_packing_text(text:str) -> pd.DataFrame:
             continue
         valeo = m.group("valeo")
         qty   = int(m.group("qty"))
-
-        # Assign to nearest PALLET line on the same page/text
         nearest_parcel = min(parcels, key=lambda t: abs(t[0] - idx))[1]
         rows.append([nearest_parcel, valeo, qty])
 
-    # Do NOT drop duplicates — keep every occurrence
     return pd.DataFrame(rows, columns=["Parcel N°","VALEO Material N°","Quantity"]).reset_index(drop=True)
 
+# ---------- autodetect ----------
 def autodetect(text:str):
     inv_df = parse_valeo_invoice_text(text)
     pack_df = parse_valeo_packing_text(text)
