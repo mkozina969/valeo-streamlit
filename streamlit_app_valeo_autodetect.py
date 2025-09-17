@@ -81,25 +81,44 @@ def parse_valeo_invoice_text(text:str) -> pd.DataFrame:
 
 # ---------- Valeo PACKING (locked logic) ----------
 def parse_valeo_packing_text(text:str) -> pd.DataFrame:
-    # proximity to PALLET lines; Quantity numeric; works if items appear above/below header on a page
-    item_pat   = re.compile(r"(?P<valeo>\d{3,})\s+(?P<qty>\d+)(?:\s+\d+)?(?:\s+[A-Z0-9\-\/]+)?\s*$")
-    parcel_pat = re.compile(r"^\s*(?P<parcel>\d{6,})\s+PALLET\b")
-
+    """
+    Valeo PACKING:
+    - Capture VALEO Material N° as a 5–8 digit number (prevents '011' etc.).
+    - Quantity is an integer.
+    - Assign Parcel N° by proximity to the nearest 'PALLET' header (above/below).
+    - Keep duplicates (same material on multiple pallets).
+    """
+    import re, pandas as pd
     lines = [l for l in text.splitlines() if l.strip()]
-    parcels = [(i, parcel_pat.match(ln).group("parcel")) for i, ln in enumerate(lines) if parcel_pat.match(ln)]
+
+    # PALLET headers (parcel numbers)
+    parcel_pat = re.compile(r"^\s*(?P<parcel>\d{6,})\s+PALLET\b")
+    parcels = [(i, parcel_pat.match(ln).group("parcel"))
+               for i, ln in enumerate(lines) if parcel_pat.match(ln)]
     if not parcels:
+        # No pallet headers -> return empty table
         return pd.DataFrame(columns=["Parcel N°","VALEO Material N°","Quantity"])
+
+    # Item lines:
+    #   <...> <VALEO 5–8 digits> <Qty int> [optional extra numeric/customer tokens] [end]
+    item_pat = re.compile(
+        r"(?P<valeo>\b\d{5,8}\b)\s+(?P<qty>\d+)(?:\s+\d+)?(?:\s+[A-Z0-9\-\/]+)?\s*$"
+    )
 
     rows = []
     for idx, ln in enumerate(lines):
         m = item_pat.search(ln)
         if not m:
             continue
-        nearest_parcel = min(parcels, key=lambda t: abs(t[0] - idx))[1]
-        rows.append([nearest_parcel, m.group("valeo"), int(m.group("qty"))])
+        valeo = m.group("valeo")
+        qty   = int(m.group("qty"))
 
-    df = pd.DataFrame(rows, columns=["Parcel N°","VALEO Material N°","Quantity"]).reset_index(drop=True)
-    return df
+        # Assign to nearest PALLET line on the same page/text
+        nearest_parcel = min(parcels, key=lambda t: abs(t[0] - idx))[1]
+        rows.append([nearest_parcel, valeo, qty])
+
+    # Do NOT drop duplicates — keep every occurrence
+    return pd.DataFrame(rows, columns=["Parcel N°","VALEO Material N°","Quantity"]).reset_index(drop=True)
 
 def autodetect(text:str):
     inv_df = parse_valeo_invoice_text(text)
