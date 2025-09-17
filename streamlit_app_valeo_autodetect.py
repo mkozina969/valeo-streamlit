@@ -14,18 +14,18 @@ def eu_to_float(s: str):
     except Exception:
         return None
 
-def read_pdf_text(file):
+def read_pdf_pages(file):
+    """Return list[str]: text of each page, preserving page order."""
     with pdfplumber.open(io.BytesIO(file.read())) as pdf:
-        page_texts = [(p.extract_text() or "") for p in pdf.pages]
-    return "\n".join(page_texts)
+        return [(p.extract_text() or "") for p in pdf.pages]
 
 # ---------- Valeo INVOICE ----------
-def parse_valeo_invoice_text(text:str) -> pd.DataFrame:
+def parse_valeo_invoice_text(full_text:str) -> pd.DataFrame:
     rows = []
     current_inv = None
     inv_re = re.compile(r"\b(695\d{6})\b")  # Valeo invoice number
 
-    for raw_line in (l for l in text.splitlines() if l.strip()):
+    for raw_line in (l for l in full_text.splitlines() if l.strip()):
         # capture invoice number if present
         m_inv = inv_re.search(raw_line)
         if m_inv:
@@ -73,46 +73,57 @@ def parse_valeo_invoice_text(text:str) -> pd.DataFrame:
 
         rows.append([supplier_token, qty, net_price, tot_net, current_inv])
 
-    df = pd.DataFrame(rows, columns=["Supplier_ID","Qty","Net Price","Tot. Net Value","InvoiceNo"])
-    return df
+    return pd.DataFrame(rows, columns=["Supplier_ID","Qty","Net Price","Tot. Net Value","InvoiceNo"])
 
-# ---------- Valeo PACKING ----------
-def parse_valeo_packing_text(text:str) -> pd.DataFrame:
+# ---------- Valeo PACKING (sequential, order-preserving) ----------
+def parse_valeo_packing_pages(page_texts:list[str]) -> pd.DataFrame:
     """
-    Valeo PACKING:
-    - VALEO Material N° must be 5–8 digits (filters out codes like '011').
-    - Quantity is integer.
-    - Assign Parcel N° by nearest 'PALLET' line.
-    - Keep duplicates (same item across multiple pallets).
+    - Walk pages top→bottom preserving order.
+    - Maintain `current_parcel` when encountering '<7+ digits> PALLET' header.
+    - Item match is robust; VALEO code is 4–8 digits (filters '011', keeps real 4-digit codes).
+    - Keep duplicates (same item on multiple pallets).
     """
-    lines = [l for l in text.splitlines() if l.strip()]
-
-    # PALLET headers
     parcel_pat = re.compile(r"^\s*(?P<parcel>\d{6,})\s+PALLET\b")
-    parcels = [(i, parcel_pat.match(ln).group("parcel"))
-               for i, ln in enumerate(lines) if parcel_pat.match(ln)]
-    if not parcels:
-        return pd.DataFrame(columns=["Parcel N°","VALEO Material N°","Quantity"])
-
-    # Items
-    item_pat = re.compile(r"(?P<valeo>\b\d{5,8}\b)\s+(?P<qty>\d+)(?:\s+\d+)?(?:\s+[A-Z0-9\-\/]+)?\s*$")
+    # primary item pattern: line starts with code + qty
+    item_pat_a = re.compile(r"^\s*(?P<valeo>\d{4,8})\s+(?P<qty>\d+)\b")
+    # fallback: code appears earlier, qty later before EOL (handles odd spacing)
+    item_pat_b = re.compile(r"\b(?P<valeo>\d{4,8})\b.*?\s(?P<qty>\d{1,4})\b(?:\s+\d+)?(?:\s+[A-Z0-9\-\/]+)?\s*$")
 
     rows = []
-    for idx, ln in enumerate(lines):
-        m = item_pat.search(ln)
-        if not m:
-            continue
-        valeo = m.group("valeo")
-        qty   = int(m.group("qty"))
-        nearest_parcel = min(parcels, key=lambda t: abs(t[0] - idx))[1]
-        rows.append([nearest_parcel, valeo, qty])
+    current_parcel = None
+
+    for page in page_texts:
+        lines = [l for l in page.splitlines() if l.strip()]
+        for ln in lines:
+            # PALLET header updates current parcel
+            mp = parcel_pat.match(ln)
+            if mp:
+                current_parcel = mp.group("parcel")
+                continue
+
+            # try item patterns (only if we already know which pallet we're on)
+            if current_parcel is None:
+                # we haven't seen a PALLET yet -> these lines belong to previous page's pallet continuation
+                # so we skip until we see the first PALLET (prevents misassignment)
+                continue
+
+            ma = item_pat_a.search(ln)
+            mb = item_pat_b.search(ln) if not ma else None
+            m  = ma or mb
+            if not m:
+                continue
+
+            valeo = m.group("valeo")
+            qty   = int(m.group("qty"))
+            rows.append([current_parcel, valeo, qty])
 
     return pd.DataFrame(rows, columns=["Parcel N°","VALEO Material N°","Quantity"]).reset_index(drop=True)
 
 # ---------- autodetect ----------
-def autodetect(text:str):
-    inv_df = parse_valeo_invoice_text(text)
-    pack_df = parse_valeo_packing_text(text)
+def autodetect(page_texts:list[str]):
+    full_text = "\n".join(page_texts)
+    inv_df  = parse_valeo_invoice_text(full_text)
+    pack_df = parse_valeo_packing_pages(page_texts)
     return inv_df, pack_df
 
 # ---------- UI ----------
@@ -120,9 +131,9 @@ if uploads:
     for up in uploads:
         st.markdown("---")
         st.subheader(f"File: {up.name}")
-        text = read_pdf_text(up)
+        pages = read_pdf_pages(up)
 
-        inv_df, pack_df = autodetect(text)
+        inv_df, pack_df = autodetect(pages)
         produced_any = False
 
         if len(inv_df) > 0:
@@ -141,7 +152,7 @@ if uploads:
 
         if len(pack_df) > 0:
             produced_any = True
-            st.write(f"**Packing lines detected:** {len(pack_df)} rows")
+            st.write(f"**Packing lines detected (order preserved):** {len(pack_df)} rows")
             st.dataframe(pack_df, use_container_width=True, height=320)
             buf2 = io.BytesIO()
             with pd.ExcelWriter(buf2, engine="openpyxl") as xw:
