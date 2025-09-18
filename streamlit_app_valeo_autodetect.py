@@ -18,15 +18,14 @@ def eu_to_float(s: str):
 def read_pdf(file):
     return pdfplumber.open(io.BytesIO(file.read()))
 
-def read_pdf_text(file):
-    with pdfplumber.open(io.BytesIO(file.read())) as pdf:
-        return "\n".join([(p.extract_text() or "") for p in pdf.pages])
+def read_all_text(pdf):
+    return "\n".join([(p.extract_text() or "") for p in pdf.pages])
 
 # ---------- Valeo INVOICE ----------
 def parse_valeo_invoice_text(full_text:str) -> pd.DataFrame:
     rows = []
     current_inv = None
-    inv_re = re.compile(r"\b(695\d{6})\b")
+    inv_re = re.compile(r"\b(695\d{6})\b")  # Valeo invoice number
 
     for raw_line in (l for l in full_text.splitlines() if l.strip()):
         m_inv = inv_re.search(raw_line)
@@ -73,12 +72,20 @@ def parse_valeo_invoice_text(full_text:str) -> pd.DataFrame:
 
     return pd.DataFrame(rows, columns=["Supplier_ID","Qty","Net Price","Tot. Net Value","InvoiceNo"])
 
-# ---------- Valeo PACKING (using extract_words) ----------
+# ---------- Valeo PACKING (column-aligned + order-preserving) ----------
 def parse_valeo_packing_pdf(pdf) -> pd.DataFrame:
+    """
+    Only process pages that contain 'PACKING LIST'.
+    Detect the header columns (x position of 'VALEO Material N°' and 'Quantity'),
+    then, line by line, take values only from those column windows.
+    Keep duplicates and preserve order. Forward-fill Parcel N° between '... PALLET' headers.
+    """
     rows = []
     current_parcel = None
-    parcel_pat = re.compile(r"^\s*(?P<parcel>\d{6,})$")
-    item_code_pat = re.compile(r"^\d{4,8}$")
+    PALLET_RE = re.compile(r"\bPALLET\b", re.IGNORECASE)
+    DIGITS_6PLUS = re.compile(r"^\d{6,}$")
+    SUPPLIER_RE = re.compile(r"^\d{4,8}$")   # supplier_id 4–8 digits
+    INT_RE = re.compile(r"^\d+$")
 
     for page in pdf.pages:
         page_text = page.extract_text() or ""
@@ -86,41 +93,82 @@ def parse_valeo_packing_pdf(pdf) -> pd.DataFrame:
             continue
 
         words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
-        # group words by line (same top within tolerance)
-        lines = defaultdict(list)
+        if not words:
+            continue
+
+        # 1) Find header line and column x-positions
+        header_candidates = [w for w in words if w["text"].strip().lower() in {"quantity", "qty", "valeo", "parcel", "parcel n°", "parcel no", "valeo material", "valeo material n°"}]
+        if not header_candidates:
+            # fallback: look for the first occurrence of 'Quantity'
+            header_candidates = [w for w in words if w["text"].strip().lower() == "quantity"]
+
+        # choose y of header as the smallest 'top' among candidates containing 'quantity'
+        qty_headers = [w for w in words if w["text"].strip().lower() == "quantity"]
+        if qty_headers:
+            header_y = min(qh["top"] for qh in qty_headers)
+            qty_x = sorted(qty_headers, key=lambda w: w["x0"])[0]["x0"]
+        else:
+            # if somehow 'Quantity' word not recognized, approximate with the rightmost numeric column x
+            header_y = min(w["top"] for w in words)
+            qty_x = max(w["x0"] for w in words) - 100  # rough fallback
+
+        # find x for 'VALEO Material'
+        valeo_headers = [w for w in words if "valeo" in w["text"].strip().lower()]
+        if valeo_headers:
+            valeo_x = sorted(valeo_headers, key=lambda w: w["x0"])[0]["x0"]
+        else:
+            # heuristic fallback: use mid-left of the page
+            valeo_x = page.width * 0.55 if hasattr(page, "width") else qty_x - 200
+
+        # define column windows (tunable widths)
+        QTY_WIN = (qty_x - 15, qty_x + 120)
+        VAL_WIN = (valeo_x - 30, valeo_x + 180)
+
+        # 2) Group words into visual lines (same y within tolerance)
+        TOL = 3.0
+        line_map = defaultdict(list)
         for w in words:
-            lines[round(w["top"], 1)].append(w)
+            line_map[round(w["top"], 1)].append(w)
 
-        for _, ws in sorted(lines.items(), key=lambda kv: kv[0]):
-            texts = [w["text"] for w in sorted(ws, key=lambda x: x["x0"])]
+        # 3) Iterate lines in order
+        for _, ws in sorted(line_map.items(), key=lambda kv: kv[0]):
+            ws_sorted = sorted(ws, key=lambda x: x["x0"])
+            texts = [w["text"] for w in ws_sorted]
 
-            # detect parcel header
-            if len(texts) >= 2 and texts[1].upper().startswith("PALLET") and texts[0].isdigit():
-                current_parcel = texts[0]
-                continue
+            # 3a) Detect new PALLET header: any line that has a big number + the word PALLET
+            if any(PALLET_RE.search(t) for t in texts):
+                # take the first 6+ digit token on that line as the parcel id
+                parcel_tokens = [t for t in texts if DIGITS_6PLUS.match(t)]
+                if parcel_tokens:
+                    current_parcel = parcel_tokens[0]
+                    continue
 
             if not current_parcel:
                 continue
 
-            # find supplier_id and quantity in this line
-            supplier_ids = [t for t in texts if item_code_pat.match(t)]
-            qtys = [t for t in texts if t.isdigit()]
-            if supplier_ids and qtys:
-                supplier = supplier_ids[0]
-                qty = int(qtys[-1])  # take rightmost number as quantity
-                rows.append([current_parcel, supplier, qty])
+            # 3b) Find supplier_id strictly in the VALEO column window
+            supplier_tokens = [w["text"] for w in ws_sorted
+                               if VAL_WIN[0] <= w["x0"] <= VAL_WIN[1] and SUPPLIER_RE.match(w["text"])]
+            if not supplier_tokens:
+                continue
+            supplier_id = supplier_tokens[0]
+
+            # 3c) Find quantity strictly in the Quantity column window
+            qty_tokens = [w["text"] for w in ws_sorted
+                          if QTY_WIN[0] <= w["x0"] <= QTY_WIN[1] and INT_RE.match(w["text"])]
+            if not qty_tokens:
+                continue
+            quantity = int(qty_tokens[-1])  # rightmost numeric in the qty column
+
+            rows.append([current_parcel, supplier_id, quantity])
 
     return pd.DataFrame(rows, columns=["Parcel N°","VALEO Material N°","Quantity"]).reset_index(drop=True)
 
 # ---------- autodetect ----------
-def autodetect(file):
-    pdf = read_pdf(file)
-    text = "\n".join([(p.extract_text() or "") for p in pdf.pages])
-
+def autodetect(pdf):
+    text = read_all_text(pdf)
     inv_df  = parse_valeo_invoice_text(text)
     pack_df = parse_valeo_packing_pdf(pdf)
-
-    pdf.close()
     return inv_df, pack_df
 
 # ---------- UI ----------
@@ -128,7 +176,10 @@ if uploads:
     for up in uploads:
         st.markdown("---")
         st.subheader(f"File: {up.name}")
-        inv_df, pack_df = autodetect(up)
+
+        pdf = read_pdf(up)
+        inv_df, pack_df = autodetect(pdf)
+        pdf.close()
 
         produced_any = False
 
@@ -148,7 +199,7 @@ if uploads:
 
         if len(pack_df) > 0:
             produced_any = True
-            st.write(f"**Packing lines detected:** {len(pack_df)} rows (Σ Quantity={pack_df['Quantity'].sum()})")
+            st.write(f"**Packing lines detected:** {len(pack_df)} rows (Σ Quantity = {pack_df['Quantity'].sum()})")
             st.dataframe(pack_df, use_container_width=True, height=320)
             buf2 = io.BytesIO()
             with pd.ExcelWriter(buf2, engine="openpyxl") as xw:
