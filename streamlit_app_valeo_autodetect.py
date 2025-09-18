@@ -91,7 +91,7 @@ def parse_valeo_packing_pdf(pdf) -> pd.DataFrame:
     rows = []
     current_parcel = None
 
-    PALLET_WORD = re.compile(r"\bPALLET\b", re.IGNORECASE)
+    PALLET_WORD = re.compile(r"\b(PALLET|CARTON)\b", re.IGNORECASE)
     PARCEL_ID   = re.compile(r"^\d{6,}$")
     SUPPLIER_ID = re.compile(r"^\d{4,8}$")
     INT_ONLY    = re.compile(r"^\d{1,4}$")
