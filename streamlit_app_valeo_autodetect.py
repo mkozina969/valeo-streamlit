@@ -82,7 +82,7 @@ def parse_valeo_packing_pdf(pdf) -> pd.DataFrame:
       - detect header row where 'VALEO' and 'Quantity' sit on the same line;
       - build tight x-windows from the header tokens themselves;
       - iterate lines BELOW the header, top->bottom:
-          * update current parcel on '<6+ digits> ... PALLET,CARTON'
+          * update current parcel on '<6+ digits> ... PALLET'
           * capture supplier_id (4–8 digits) INSIDE VALEO window
           * capture qty (1–4 digits) INSIDE Quantity window
         If both present and we have a current parcel -> append row.
