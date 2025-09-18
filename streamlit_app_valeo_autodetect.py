@@ -21,11 +21,11 @@ def read_pdf(file):
 def read_all_text(pdf):
     return "\n".join([(p.extract_text() or "") for p in pdf.pages])
 
-# ---------- Valeo INVOICE (same as before) ----------
+# ---------- Valeo INVOICE (unchanged) ----------
 def parse_valeo_invoice_text(full_text:str) -> pd.DataFrame:
     rows = []
     current_inv = None
-    inv_re = re.compile(r"\b(695\d{6})\b")
+    inv_re = re.compile(r"\b(695\d{6})\b")  # Valeo invoice number
 
     for raw_line in (l for l in full_text.splitlines() if l.strip()):
         m_inv = inv_re.search(raw_line)
@@ -44,9 +44,11 @@ def parse_valeo_invoice_text(full_text:str) -> pd.DataFrame:
         if len(tok) < 7:
             continue
 
+        # last two are Net Price, Tot. Net
         if not (re.fullmatch(r"[\d\.,]+", tok[-1]) and re.fullmatch(r"[\d\.,]+", tok[-2])):
             continue
 
+        # find "... Qty(int) Orig(AA) Customs(6-8d) ..."
         j = None
         for k in range(len(tok)-3, 1, -1):
             if (re.fullmatch(r"[A-Z]{2}", tok[k]) and
@@ -57,6 +59,7 @@ def parse_valeo_invoice_text(full_text:str) -> pd.DataFrame:
         if j is None:
             continue
 
+        # supplier_id = first numeric token BEFORE Qty
         supplier_token = None
         for t in tok[:j-1]:
             if re.fullmatch(r"\d+", t):
@@ -72,25 +75,26 @@ def parse_valeo_invoice_text(full_text:str) -> pd.DataFrame:
 
     return pd.DataFrame(rows, columns=["Supplier_ID","Qty","Net Price","Tot. Net Value","InvoiceNo"])
 
-# ---------- Valeo PACKING (header-locked, column windows, order-preserving) ----------
+# ---------- Valeo PACKING (header-locked, order-preserving, cross-page) ----------
 def parse_valeo_packing_pdf(pdf) -> pd.DataFrame:
     """
-    Only process pages with 'PACKING LIST'.
-    Detect header line to learn exact x0..x1 windows for 'VALEO Material N°' and 'Quantity'.
-    For each visual line:
-      - supplier_id: 4–8 digits inside VALEO window
-      - qty: integer inside Quantity window AND qty <= 1000
-    Walk top->bottom, forward-fill Parcel N° between '<digits> PALLET' headers.
-    Keep duplicates. Preserve order.
+    Process only pages with 'PACKING LIST'. For each such page:
+      - detect header row where 'VALEO' and 'Quantity' sit on the same line;
+      - build tight x-windows from the header tokens themselves;
+      - iterate lines BELOW the header, top->bottom:
+          * update current parcel on '<6+ digits> ... PALLET'
+          * capture supplier_id (4–8 digits) INSIDE VALEO window
+          * capture qty (1–4 digits) INSIDE Quantity window
+        If both present and we have a current parcel -> append row.
+    Keeps duplicates and preserves exact order across pages.
     """
     rows = []
     current_parcel = None
 
-    # patterns
     PALLET_WORD = re.compile(r"\bPALLET\b", re.IGNORECASE)
     PARCEL_ID   = re.compile(r"^\d{6,}$")
     SUPPLIER_ID = re.compile(r"^\d{4,8}$")
-    INT_ONLY    = re.compile(r"^\d+$")
+    INT_ONLY    = re.compile(r"^\d{1,4}$")
     SKIP_LINE   = re.compile(r"(dimensions|total\s+net\s+weight|total\s+gross\s+weight|type\s+of\s+parcel)",
                              re.IGNORECASE)
 
@@ -103,51 +107,49 @@ def parse_valeo_packing_pdf(pdf) -> pd.DataFrame:
         if not words:
             continue
 
-        # 1) Group to visual lines
+        # Group into visual lines
         line_map = defaultdict(list)
         for w in words:
             line_map[round(w["top"], 1)].append(w)
         lines = [(y, sorted(ws, key=lambda x: x["x0"])) for y, ws in sorted(line_map.items(), key=lambda kv: kv[0])]
 
-        # 2) Find header row (contains both 'VALEO' and 'Quantity' on ~same y)
+        # Find header (must contain 'Quantity' and 'Valeo' on the same y)
         header = None
         for y, ws in lines:
             texts_lower = [w["text"].strip().lower() for w in ws]
-            if any("quantity" == t for t in texts_lower) and any("valeo" in t for t in texts_lower):
-                header = ws
+            if "quantity" in texts_lower and any("valeo" in t for t in texts_lower):
+                header = (y, ws)
                 break
         if not header:
-            # if not found, skip page (better to skip than to introduce noise)
+            # skip page if header can't be found (safer than guessing)
             continue
 
-        # column x-windows from header words themselves (tight)
-        qty_hdrs   = [w for w in header if w["text"].strip().lower() == "quantity"]
-        valeo_hdrs = [w for w in header if "valeo" in w["text"].strip().lower()]
+        header_y = header[0]
+        qty_hdrs   = [w for w in header[1] if w["text"].strip().lower() == "quantity"]
+        valeo_hdrs = [w for w in header[1] if "valeo" in w["text"].strip().lower()]
 
-        qty_win  = (min(w["x0"] for w in qty_hdrs) - 2,  max(w["x1"] for w in qty_hdrs) + 2) if qty_hdrs else (page.width*0.75, page.width*0.95)
-        valeo_win= (min(w["x0"] for w in valeo_hdrs) - 2, max(w["x1"] for w in valeo_hdrs) + 2) if valeo_hdrs else (page.width*0.45, page.width*0.7)
+        # tight windows from header tokens
+        qty_win   = (min(w["x0"] for w in qty_hdrs) - 1,  max(w["x1"] for w in qty_hdrs) + 60) if qty_hdrs else (page.width*0.75, page.width*0.95)
+        valeo_win = (min(w["x0"] for w in valeo_hdrs) - 10, max(w["x1"] for w in valeo_hdrs) + 20) if valeo_hdrs else (page.width*0.45, page.width*0.7)
 
-        # hard cap on qty values to avoid weights/codes being picked
-        QTY_MAX = 1000
-
-        # 3) Iterate subsequent lines (after header) in order
-        header_y = header[0]["top"]
+        # Walk lines in order *below* the header
         for y, ws in lines:
             if y <= header_y:
-                continue  # stay below header
+                continue
             if SKIP_LINE.search(" ".join(w["text"] for w in ws)):
                 continue
 
+            # detect & set parcel if this line has PALLET
             texts = [w["text"] for w in ws]
-
-            # detect new PALLET
             if any(PALLET_WORD.search(t) for t in texts):
                 parcel_tokens = [w["text"] for w in ws if PARCEL_ID.match(w["text"])]
                 if parcel_tokens:
                     current_parcel = parcel_tokens[0]
-                continue
+                # NOTE: do not 'continue' here — the same line can contain the first item
 
             if not current_parcel:
+                # top-of-page lines before the first PALLET belong to previous page's parcel
+                # so if we still don't have one, skip until first PALLET on the document
                 continue
 
             # supplier inside VALEO window
@@ -157,16 +159,14 @@ def parse_valeo_packing_pdf(pdf) -> pd.DataFrame:
                 continue
             supplier_id = supplier_tokens[0]
 
-            # quantity inside Quantity window (pure int, <= QTY_MAX)
-            qty_tokens = [int(w["text"]) for w in ws
+            # quantity inside Quantity window (pure int, <= 4 digits)
+            qty_tokens = [w["text"] for w in ws
                           if qty_win[0] <= w["x0"] <= qty_win[1] and INT_ONLY.match(w["text"])]
             if not qty_tokens:
                 continue
-            qty = qty_tokens[-1]
-            if qty > QTY_MAX:
-                continue  # guard against weights/codes
+            quantity = int(qty_tokens[-1])  # rightmost int in Quantity column
 
-            rows.append([current_parcel, supplier_id, qty])
+            rows.append([current_parcel, supplier_id, quantity])
 
     return pd.DataFrame(rows, columns=["Parcel N°","VALEO Material N°","Quantity"]).reset_index(drop=True)
 
@@ -205,7 +205,8 @@ if uploads:
 
         if len(pack_df) > 0:
             produced_any = True
-            st.write(f"**Packing lines detected:** {len(pack_df)} rows (Σ Quantity = {pack_df['Quantity'].sum()})")
+            sum_qty = int(pack_df["Quantity"].sum())
+            st.write(f"**Packing lines detected:** {len(pack_df)} rows  (Σ Quantity = {sum_qty})")
             st.dataframe(pack_df, use_container_width=True, height=320)
             buf2 = io.BytesIO()
             with pd.ExcelWriter(buf2, engine="openpyxl") as xw:
